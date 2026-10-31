@@ -1,0 +1,285 @@
+# Docker Compose: KPB Real-World (Kelompok 5), mengikuti Design Project bagian 2.
+#
+# 20 container = 20 VM. Skala: 1,0 CPU = 10.000 MIPS.
+#
+#   VM        Tipe  PE x MIPS     CPU container   RAM   Port
+#   vm00-03   V3    4 x 2.500  ->  1,0 CPU         8g    9100-9103
+#   vm04-11   V2    2 x 1.500  ->  0,3 CPU         4g    9104-9111
+#   vm12-19   V1    1 x 1.000  ->  0,1 CPU         2g    9112-9119
+#
+# * Satu container = satu proses eksekusi (worker.py tidak lagi memecah PE jadi
+#   beberapa proses paralel). Task dikerjakan berurutan satu per satu, sehingga
+#   satu task yang berjalan memakai penuh kuota CPU VM-nya (CloudletSchedulerSpaceShared).
+# * cpu_quota / cpu_period (periode 10 ms) mengunci kuota CPU total container;
+#   rasio tetap 1 : 3 : 10 sesuai kapasitas VM (V1 : V2 : V3).
+# * mem_limit = RAM VM di desain (batas atas, bukan reservasi).
+# * Datacenter = jaringan Docker (dc1 Performance, dc2 Efficiency). Label
+#   soka.host mengikuti penempatan VM hasil CloudSim (results/simulation/placement.csv).
+#
+# Jalankan:  docker compose up -d   |   Matikan:  docker compose down
+#
+# ============================================================================================
+# Penjelasan rinci
+# ============================================================================================
+# Peran file:
+#   Membangun infrastruktur "real-world" pengganti VM CloudSim. Setiap service vmNN adalah satu
+#   container yang menjalankan realworld/worker/worker.py (HTTP server kecil). Runner
+#   realworld/kpb_realworld.py mengirim batch task ke tiap container lewat port 9100-9119, worker
+#   mengeksekusi task berurutan (FIFO) dengan membakar CPU, lalu melaporkan waktu selesai.
+#
+# Bagaimana MIPS VM ditiru:
+#   Kecepatan VM tidak diatur oleh kode, tetapi oleh kuota CPU dari kernel Linux (cgroup / CFS):
+#     cpu_period = 10000 mikrodetik (10 ms)  -> panjang satu jendela penjatahan CPU
+#     cpu_quota  = berapa mikrodetik CPU yang boleh dipakai container dalam setiap jendela 10 ms
+#   Jadi jumlah CPU = cpu_quota / cpu_period, dan dengan skala 1,0 CPU = 10.000 MIPS:
+#     V3: 4 PE x 2.500 = 10.000 MIPS -> 10000/10000 = 1,0 CPU
+#     V2: 2 PE x 1.500 =  3.000 MIPS ->  3000/10000 = 0,3 CPU
+#     V1: 1 PE x 1.000 =  1.000 MIPS ->  1000/10000 = 0,1 CPU
+#   Task yang sama (L MI) di V1 butuh waktu 10x lebih lama daripada di V3, persis seperti L/C di
+#   CloudSim. Tidak ada cpuset (pinning ke core tertentu): kernel boleh menjalankan container di core
+#   mana pun, yang dibatasi hanya total waktu CPU-nya.
+#
+# Pemetaan ke desain (VM -> datacenter/host, sama dengan results/simulation/placement.csv):
+#   DC-1 Performance (network dc1, host tipe A 8 PE x 3.000 MIPS):
+#     dc1-hostA0: vm00 (V3), vm03 (V3)
+#     dc1-hostA1: vm01 (V3), vm04 (V2), vm06 (V2)
+#     dc1-hostA2: vm02 (V3), vm05 (V2), vm07 (V2)
+#   DC-2 Efficiency (network dc2, host tipe B 8 PE x 1.800 MIPS):
+#     dc2-hostB0: vm08 (V2), vm11 (V2), vm16 (V1), vm19 (V1)
+#     dc2-hostB1: vm09 (V2), vm12 (V1), vm14 (V1), vm17 (V1)
+#     dc2-hostB2: vm10 (V2), vm13 (V1), vm15 (V1), vm18 (V1)
+#   Catatan: semua container tetap berjalan di SATU mesin fisik (laptop/PC). Label soka.dc / soka.host
+#   hanya metadata (untuk dokumentasi dan "docker ps --filter label=..."); host dan datacenter dipakai
+#   oleh runner untuk menghitung energi dan biaya, bukan untuk membatasi CPU.
+# ============================================================================================
+
+# Template bersama semua worker. Key berawalan "x-" diabaikan oleh Docker Compose (extension field),
+# sehingga bisa dipakai sebagai tempat menyimpan konfigurasi. "&worker" = YAML anchor (nama template);
+# setiap service menyalinnya dengan "<<: *worker" (merge key), lalu menambah/menimpa key miliknya.
+x-worker: &worker
+  # Image Python resmi versi ringan; worker.py hanya memakai standard library, jadi tidak perlu build.
+  image: python:3.12-slim
+  # -u = output tidak di-buffer, supaya log container langsung terlihat di "docker logs".
+  command: ["python3", "-u", "/app/worker.py"]
+  volumes:
+    # Folder realworld/worker di-mount ke /app secara read-only (ro): kode worker cukup satu salinan
+    # untuk 20 container, dan perubahan kode berlaku setelah container di-restart/recreate.
+    - ./worker:/app:ro
+  # Container otomatis hidup lagi bila crash atau Docker di-restart, kecuali dihentikan manual.
+  restart: unless-stopped
+  # Periode penjatahan CPU 10.000 mikrodetik = 10 ms (sama untuk semua VM); kuotanya per service.
+  cpu_period: 10000
+
+# Dua jaringan bridge Docker, satu per datacenter. Container di dc1 tidak bisa menghubungi container
+# di dc2 secara langsung (terisolasi seperti dua datacenter terpisah). Runner di host tidak memakai
+# jaringan ini, melainkan port yang dipublikasikan ke 127.0.0.1. "name" = nama jaringan asli di Docker.
+networks:
+  dc1:
+    name: soka_dc1_performance
+  dc2:
+    name: soka_dc2_efficiency
+
+services:
+  # ------------------------------------------------------------------------------------------
+  # Pola setiap service (dijelaskan sekali di vm00; 19 service lain sama, hanya nilainya beda):
+  #   <<: *worker        salin template x-worker (image, command, volume, restart, cpu_period)
+  #   container_name     nama tetap kpb_vmNN; dipakai skrip (filter name=kpb_vm, analyze_grid tier())
+  #   cpu_quota          kuota CPU per 10 ms -> kapasitas VM (lihat tabel di atas)
+  #   mem_limit          batas RAM sesuai tipe VM (V3 8g, V2 4g, V1 2g); worker sendiri hanya butuh
+  #                      beberapa MB, jadi ini batas atas, bukan memori yang langsung dipakai
+  #   environment        dibaca worker.py: VM_NAME dan VM_TYPE dilaporkan di /health (runner
+  #                      mengecek VM_TYPE cocok), PORT = port HTTP di dalam container
+  #   labels             metadata datacenter, host, dan tipe VM (lihat pemetaan di atas)
+  #   networks           jaringan datacenter tempat VM ini berada
+  #   ports              "127.0.0.1:91NN:8000" = port 91NN di mesin host (hanya localhost, tidak
+  #                      terbuka ke jaringan luar) diteruskan ke port 8000 container. vmNN -> 9100+NN,
+  #                      sama dengan url di VMS kpb_realworld.py.
+  # ------------------------------------------------------------------------------------------
+  # Kelompok V3 (vm00-vm03): 4 PE x 2.500 MIPS = 10.000 MIPS -> 1,0 CPU, RAM 8g.
+  # Semua di DC-1 Performance (network dc1), tersebar di host A0, A1, A2, A0.
+  vm00:
+    <<: *worker
+    container_name: kpb_vm00
+    cpu_quota: 10000   # V3 = 1,0 CPU
+    mem_limit: 8g
+    environment: { VM_NAME: vm00, VM_TYPE: V3, PORT: "8000" }
+    labels: { soka.dc: "DC-1", soka.host: "dc1-hostA0", soka.vm_type: V3 }
+    networks: [dc1]
+    ports: ["127.0.0.1:9100:8000"]
+  vm01:
+    <<: *worker
+    container_name: kpb_vm01
+    cpu_quota: 10000   # V3 = 1,0 CPU
+    mem_limit: 8g
+    environment: { VM_NAME: vm01, VM_TYPE: V3, PORT: "8000" }
+    labels: { soka.dc: "DC-1", soka.host: "dc1-hostA1", soka.vm_type: V3 }
+    networks: [dc1]
+    ports: ["127.0.0.1:9101:8000"]
+  vm02:
+    <<: *worker
+    container_name: kpb_vm02
+    cpu_quota: 10000   # V3 = 1,0 CPU
+    mem_limit: 8g
+    environment: { VM_NAME: vm02, VM_TYPE: V3, PORT: "8000" }
+    labels: { soka.dc: "DC-1", soka.host: "dc1-hostA2", soka.vm_type: V3 }
+    networks: [dc1]
+    ports: ["127.0.0.1:9102:8000"]
+  vm03:
+    <<: *worker
+    container_name: kpb_vm03
+    cpu_quota: 10000   # V3 = 1,0 CPU
+    mem_limit: 8g
+    environment: { VM_NAME: vm03, VM_TYPE: V3, PORT: "8000" }
+    labels: { soka.dc: "DC-1", soka.host: "dc1-hostA0", soka.vm_type: V3 }
+    networks: [dc1]
+    ports: ["127.0.0.1:9103:8000"]
+  # Kelompok V2 bagian DC-1 (vm04-vm07): 2 PE x 1.500 MIPS = 3.000 MIPS -> 0,3 CPU, RAM 4g.
+  # Di DC-1 Performance (network dc1), host A1, A2, A1, A2.
+  vm04:
+    <<: *worker
+    container_name: kpb_vm04
+    cpu_quota: 3000   # V2 = 0,3 CPU
+    mem_limit: 4g
+    environment: { VM_NAME: vm04, VM_TYPE: V2, PORT: "8000" }
+    labels: { soka.dc: "DC-1", soka.host: "dc1-hostA1", soka.vm_type: V2 }
+    networks: [dc1]
+    ports: ["127.0.0.1:9104:8000"]
+  vm05:
+    <<: *worker
+    container_name: kpb_vm05
+    cpu_quota: 3000   # V2 = 0,3 CPU
+    mem_limit: 4g
+    environment: { VM_NAME: vm05, VM_TYPE: V2, PORT: "8000" }
+    labels: { soka.dc: "DC-1", soka.host: "dc1-hostA2", soka.vm_type: V2 }
+    networks: [dc1]
+    ports: ["127.0.0.1:9105:8000"]
+  vm06:
+    <<: *worker
+    container_name: kpb_vm06
+    cpu_quota: 3000   # V2 = 0,3 CPU
+    mem_limit: 4g
+    environment: { VM_NAME: vm06, VM_TYPE: V2, PORT: "8000" }
+    labels: { soka.dc: "DC-1", soka.host: "dc1-hostA1", soka.vm_type: V2 }
+    networks: [dc1]
+    ports: ["127.0.0.1:9106:8000"]
+  vm07:
+    <<: *worker
+    container_name: kpb_vm07
+    cpu_quota: 3000   # V2 = 0,3 CPU
+    mem_limit: 4g
+    environment: { VM_NAME: vm07, VM_TYPE: V2, PORT: "8000" }
+    labels: { soka.dc: "DC-1", soka.host: "dc1-hostA2", soka.vm_type: V2 }
+    networks: [dc1]
+    ports: ["127.0.0.1:9107:8000"]
+  # Kelompok V2 bagian DC-2 (vm08-vm11): spesifikasi sama dengan vm04-vm07 (0,3 CPU, 4g), tetapi
+  # ditempatkan di DC-2 Efficiency (network dc2), host B0, B1, B2, B0.
+  vm08:
+    <<: *worker
+    container_name: kpb_vm08
+    cpu_quota: 3000   # V2 = 0,3 CPU
+    mem_limit: 4g
+    environment: { VM_NAME: vm08, VM_TYPE: V2, PORT: "8000" }
+    labels: { soka.dc: "DC-2", soka.host: "dc2-hostB0", soka.vm_type: V2 }
+    networks: [dc2]
+    ports: ["127.0.0.1:9108:8000"]
+  vm09:
+    <<: *worker
+    container_name: kpb_vm09
+    cpu_quota: 3000   # V2 = 0,3 CPU
+    mem_limit: 4g
+    environment: { VM_NAME: vm09, VM_TYPE: V2, PORT: "8000" }
+    labels: { soka.dc: "DC-2", soka.host: "dc2-hostB1", soka.vm_type: V2 }
+    networks: [dc2]
+    ports: ["127.0.0.1:9109:8000"]
+  vm10:
+    <<: *worker
+    container_name: kpb_vm10
+    cpu_quota: 3000   # V2 = 0,3 CPU
+    mem_limit: 4g
+    environment: { VM_NAME: vm10, VM_TYPE: V2, PORT: "8000" }
+    labels: { soka.dc: "DC-2", soka.host: "dc2-hostB2", soka.vm_type: V2 }
+    networks: [dc2]
+    ports: ["127.0.0.1:9110:8000"]
+  vm11:
+    <<: *worker
+    container_name: kpb_vm11
+    cpu_quota: 3000   # V2 = 0,3 CPU
+    mem_limit: 4g
+    environment: { VM_NAME: vm11, VM_TYPE: V2, PORT: "8000" }
+    labels: { soka.dc: "DC-2", soka.host: "dc2-hostB0", soka.vm_type: V2 }
+    networks: [dc2]
+    ports: ["127.0.0.1:9111:8000"]
+  # Kelompok V1 (vm12-vm19): 1 PE x 1.000 MIPS -> 0,1 CPU, RAM 2g. Semua di DC-2 Efficiency
+  # (network dc2), host B1, B2, B1, B2, B0, B1, B2, B0.
+  vm12:
+    <<: *worker
+    container_name: kpb_vm12
+    cpu_quota: 1000   # V1 = 0,1 CPU
+    mem_limit: 2g
+    environment: { VM_NAME: vm12, VM_TYPE: V1, PORT: "8000" }
+    labels: { soka.dc: "DC-2", soka.host: "dc2-hostB1", soka.vm_type: V1 }
+    networks: [dc2]
+    ports: ["127.0.0.1:9112:8000"]
+  vm13:
+    <<: *worker
+    container_name: kpb_vm13
+    cpu_quota: 1000   # V1 = 0,1 CPU
+    mem_limit: 2g
+    environment: { VM_NAME: vm13, VM_TYPE: V1, PORT: "8000" }
+    labels: { soka.dc: "DC-2", soka.host: "dc2-hostB2", soka.vm_type: V1 }
+    networks: [dc2]
+    ports: ["127.0.0.1:9113:8000"]
+  vm14:
+    <<: *worker
+    container_name: kpb_vm14
+    cpu_quota: 1000   # V1 = 0,1 CPU
+    mem_limit: 2g
+    environment: { VM_NAME: vm14, VM_TYPE: V1, PORT: "8000" }
+    labels: { soka.dc: "DC-2", soka.host: "dc2-hostB1", soka.vm_type: V1 }
+    networks: [dc2]
+    ports: ["127.0.0.1:9114:8000"]
+  vm15:
+    <<: *worker
+    container_name: kpb_vm15
+    cpu_quota: 1000   # V1 = 0,1 CPU
+    mem_limit: 2g
+    environment: { VM_NAME: vm15, VM_TYPE: V1, PORT: "8000" }
+    labels: { soka.dc: "DC-2", soka.host: "dc2-hostB2", soka.vm_type: V1 }
+    networks: [dc2]
+    ports: ["127.0.0.1:9115:8000"]
+  vm16:
+    <<: *worker
+    container_name: kpb_vm16
+    cpu_quota: 1000   # V1 = 0,1 CPU
+    mem_limit: 2g
+    environment: { VM_NAME: vm16, VM_TYPE: V1, PORT: "8000" }
+    labels: { soka.dc: "DC-2", soka.host: "dc2-hostB0", soka.vm_type: V1 }
+    networks: [dc2]
+    ports: ["127.0.0.1:9116:8000"]
+  vm17:
+    <<: *worker
+    container_name: kpb_vm17
+    cpu_quota: 1000   # V1 = 0,1 CPU
+    mem_limit: 2g
+    environment: { VM_NAME: vm17, VM_TYPE: V1, PORT: "8000" }
+    labels: { soka.dc: "DC-2", soka.host: "dc2-hostB1", soka.vm_type: V1 }
+    networks: [dc2]
+    ports: ["127.0.0.1:9117:8000"]
+  vm18:
+    <<: *worker
+    container_name: kpb_vm18
+    cpu_quota: 1000   # V1 = 0,1 CPU
+    mem_limit: 2g
+    environment: { VM_NAME: vm18, VM_TYPE: V1, PORT: "8000" }
+    labels: { soka.dc: "DC-2", soka.host: "dc2-hostB2", soka.vm_type: V1 }
+    networks: [dc2]
+    ports: ["127.0.0.1:9118:8000"]
+  vm19:
+    <<: *worker
+    container_name: kpb_vm19
+    cpu_quota: 1000   # V1 = 0,1 CPU
+    mem_limit: 2g
+    environment: { VM_NAME: vm19, VM_TYPE: V1, PORT: "8000" }
+    labels: { soka.dc: "DC-2", soka.host: "dc2-hostB0", soka.vm_type: V1 }
+    networks: [dc2]
+    ports: ["127.0.0.1:9119:8000"]
